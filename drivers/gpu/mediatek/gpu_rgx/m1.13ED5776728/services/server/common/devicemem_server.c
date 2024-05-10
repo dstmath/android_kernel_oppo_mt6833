@@ -62,6 +62,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "lock.h"
 
 #define DEVMEMCTX_FLAGS_FAULT_ADDRESS_AVAILABLE (1 << 0)
+#define DEVMEMHEAP_REFCOUNT_MIN 1
+#define DEVMEMHEAP_REFCOUNT_MAX IMG_INT32_MAX
+#define DEVMEMRESERVATION_REFCOUNT_MIN 0
+#define DEVMEMRESERVATION_REFCOUNT_MAX IMG_INT32_MAX
 
 struct _DEVMEMINT_CTX_
 {
@@ -109,7 +113,9 @@ struct _DEVMEMINT_HEAP_
 {
 	struct _DEVMEMINT_CTX_ *psDevmemCtx;
 	IMG_UINT32 uiLog2PageSize;
-	ATOMIC_T hRefCount;
+	IMG_DEV_VIRTADDR sBaseAddr;
+	IMG_DEV_VIRTADDR sLastAddr;
+	ATOMIC_T uiRefCount;
 };
 
 struct _DEVMEMINT_RESERVATION_
@@ -117,6 +123,9 @@ struct _DEVMEMINT_RESERVATION_
 	struct _DEVMEMINT_HEAP_ *psDevmemHeap;
 	IMG_DEV_VIRTADDR sBase;
 	IMG_DEVMEM_SIZE_T uiLength;
+	/* lock used to guard against potential race when freeing reservation */
+	POS_LOCK hLock;
+	IMG_INT32 i32RefCount;
 };
 
 struct _DEVMEMINT_MAPPING_
@@ -124,6 +133,28 @@ struct _DEVMEMINT_MAPPING_
 	struct _DEVMEMINT_RESERVATION_ *psReservation;
 	PMR *psPMR;
 	IMG_UINT32 uiNumPages;
+};
+
+/*! Object representing a virtual range reservation and mapping between
+ * the virtual range and a set of PMRs.
+ *
+ * The physical allocations may be mapped entirely or partially to the entire
+ * or partial virtual range. */
+struct _DEVMEMXINT_RESERVATION_
+{
+	/*! Pointer to a device memory heap this reservation is made on. */
+	struct _DEVMEMINT_HEAP_ *psDevmemHeap;
+	/*! Base device virtual address of this reservation. */
+	IMG_DEV_VIRTADDR sBase;
+	/*! Size of this reservation (in bytes). */
+	IMG_DEVMEM_SIZE_T uiLength;
+	/*! Lock for protecting concurrent operations on the mapping. */
+	POS_LOCK hLock;
+	/*! Array of PMRs of size `uiNumPages`. This array represents how the
+	 *  physical memory is mapped to the virtual range. Each entry in the array
+	 *  represents to one device page which means that one PMR may be spread
+	 *  across many indices. */
+	PMR **ppsPMR;
 };
 
 struct _DEVMEMINT_PF_NOTIFY_
@@ -191,11 +222,21 @@ static INLINE void DevmemIntCtxRelease(DEVMEMINT_CTX *psDevmemCtx)
 /*************************************************************************/ /*!
 @Function       DevmemIntHeapAcquire
 @Description    Acquire a reference to the provided device memory heap.
-@Return         None
+@Return         IMG_TRUE if referenced and IMG_FALSE in case of error
 */ /**************************************************************************/
-static INLINE void DevmemIntHeapAcquire(DEVMEMINT_HEAP *psDevmemHeap)
+static INLINE IMG_BOOL DevmemIntHeapAcquire(DEVMEMINT_HEAP *psDevmemHeap)
 {
-	OSAtomicIncrement(&psDevmemHeap->hRefCount);
+	IMG_BOOL bSuccess = OSAtomicAddUnless(&psDevmemHeap->uiRefCount, 1,
+	                                      DEVMEMHEAP_REFCOUNT_MAX);
+
+	if (!bSuccess)
+	{
+		PVR_DPF((PVR_DBG_ERROR, "%s(): Failed to acquire the device memory "
+		         "heap, reference count has overflowed.", __func__));
+		return IMG_FALSE;
+	}
+
+	return IMG_TRUE;
 }
 
 /*************************************************************************/ /*!
@@ -207,96 +248,113 @@ static INLINE void DevmemIntHeapAcquire(DEVMEMINT_HEAP *psDevmemHeap)
 */ /**************************************************************************/
 static INLINE void DevmemIntHeapRelease(DEVMEMINT_HEAP *psDevmemHeap)
 {
-	OSAtomicDecrement(&psDevmemHeap->hRefCount);
+	IMG_BOOL bSuccess = OSAtomicSubtractUnless(&psDevmemHeap->uiRefCount, 1,
+	                                           DEVMEMHEAP_REFCOUNT_MIN);
+
+	if (!bSuccess)
+	{
+		PVR_DPF((PVR_DBG_ERROR, "%s(): Failed to acquire the device memory "
+		         "heap, reference count has underflowed.", __func__));
+	}
 }
 
 PVRSRV_ERROR
 DevmemIntUnpin(PMR *psPMR)
 {
-	PVRSRV_ERROR eError;
-
-	/* Unpin */
-	eError = PMRUnpinPMR(psPMR, IMG_FALSE);
-
-	return eError;
+	PVR_UNREFERENCED_PARAMETER(psPMR);
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
 }
 
 PVRSRV_ERROR
 DevmemIntUnpinInvalidate(DEVMEMINT_MAPPING *psDevmemMapping, PMR *psPMR)
 {
-	PVRSRV_ERROR eError;
-
-	eError = PMRUnpinPMR(psPMR, IMG_TRUE);
-	PVR_GOTO_IF_ERROR(eError, e_exit);
-
-	/* Invalidate mapping */
-	eError = MMU_ChangeValidity(psDevmemMapping->psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
-	                            psDevmemMapping->psReservation->sBase,
-	                            psDevmemMapping->uiNumPages,
-	                            psDevmemMapping->psReservation->psDevmemHeap->uiLog2PageSize,
-	                            IMG_FALSE, /* !< Choose to invalidate PT entries */
-	                            psPMR);
-
-e_exit:
-	return eError;
+	PVR_UNREFERENCED_PARAMETER(psDevmemMapping);
+	PVR_UNREFERENCED_PARAMETER(psPMR);
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
 }
-
 PVRSRV_ERROR
 DevmemIntPin(PMR *psPMR)
 {
-	PVRSRV_ERROR eError = PVRSRV_OK;
-
-	/* Start the pinning */
-	eError = PMRPinPMR(psPMR);
-
-	return eError;
+	PVR_UNREFERENCED_PARAMETER(psPMR);
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
 }
 
 PVRSRV_ERROR
 DevmemIntPinValidate(DEVMEMINT_MAPPING *psDevmemMapping, PMR *psPMR)
 {
-	PVRSRV_ERROR eError;
-	PVRSRV_ERROR eErrorMMU = PVRSRV_OK;
-	IMG_UINT32 uiLog2PageSize = psDevmemMapping->psReservation->psDevmemHeap->uiLog2PageSize;
+	PVR_UNREFERENCED_PARAMETER(psDevmemMapping);
+	PVR_UNREFERENCED_PARAMETER(psPMR);
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
+}
+/*************************************************************************/ /*!
+@Function       DevmemIntReservationAcquire
+@Description    Acquire a reference to the provided device memory reservation.
+@Return         IMG_TRUE if referenced and IMG_FALSE in case of error
+*/ /**************************************************************************/
+IMG_BOOL DevmemIntReservationAcquire(DEVMEMINT_RESERVATION *psDevmemReservation)
+{
+	IMG_BOOL bSuccess;
 
-	/* Start the pinning */
-	eError = PMRPinPMR(psPMR);
+	OSLockAcquire(psDevmemReservation->hLock);
 
-	if (eError == PVRSRV_OK)
+	bSuccess = (psDevmemReservation->i32RefCount < DEVMEMRESERVATION_REFCOUNT_MAX);
+
+	if (!bSuccess)
 	{
-		/* Make mapping valid again */
-		eErrorMMU = MMU_ChangeValidity(psDevmemMapping->psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
-		                            psDevmemMapping->psReservation->sBase,
-		                            psDevmemMapping->uiNumPages,
-		                            uiLog2PageSize,
-		                            IMG_TRUE, /* !< Choose to make PT entries valid again */
-		                            psPMR);
+		PVR_DPF((PVR_DBG_ERROR, "%s(): Failed to acquire the device memory "
+		         "reservation, reference count has overflowed.", __func__));
 	}
-	else if (eError == PVRSRV_ERROR_PMR_NEW_MEMORY)
+	else
 	{
-		/* If we lost the physical backing we have to map it again because
-		 * the old physical addresses are not valid anymore. */
-		IMG_UINT32 uiFlags;
-		uiFlags = PMR_Flags(psPMR);
-
-		eErrorMMU = MMU_MapPages(psDevmemMapping->psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
-		                         uiFlags,
-		                         psDevmemMapping->psReservation->sBase,
-		                         psPMR,
-		                         0,
-		                         psDevmemMapping->uiNumPages,
-		                         NULL,
-		                         uiLog2PageSize);
+		psDevmemReservation->i32RefCount++;
 	}
 
-	/* Just overwrite eError if the mappings failed.
-	 * PMR_NEW_MEMORY has to be propagated to the user. */
-	if (eErrorMMU != PVRSRV_OK)
+	OSLockRelease(psDevmemReservation->hLock);
+	return bSuccess;
+}
+
+/*************************************************************************/ /*!
+@Function       DevmemIntReservationRelease
+@Description    Release the reference to the provided device memory reservation.
+                If this is the last reference which was taken then the
+                reservation will be freed.
+@Return         None.
+*/ /**************************************************************************/
+void DevmemIntReservationRelease(DEVMEMINT_RESERVATION *psDevmemReservation)
+{
+	OSLockAcquire(psDevmemReservation->hLock);
+
+	if (psDevmemReservation->i32RefCount == DEVMEMRESERVATION_REFCOUNT_MIN)
 	{
-		eError = eErrorMMU;
+		PVR_DPF((PVR_DBG_ERROR, "%s(): Failed to release the device memory "
+		         "reservation, reference count has underflowed.", __func__));
+	}
+	else
+	{
+		/* Decrement reservation reference count and free it
+		 * if this was the final reference
+		 */
+		if (--psDevmemReservation->i32RefCount == DEVMEMRESERVATION_REFCOUNT_MIN)
+		{
+			DEVMEMINT_HEAP *psDevmemHeap = psDevmemReservation->psDevmemHeap;
+
+			MMU_Free(psDevmemHeap->psDevmemCtx->psMMUContext,
+			         psDevmemReservation->sBase,
+			         psDevmemReservation->uiLength,
+			         psDevmemHeap->uiLog2PageSize);
+
+			/* Destroy lock */
+			OSLockRelease(psDevmemReservation->hLock);
+			OSLockDestroy(psDevmemReservation->hLock);
+			DevmemIntHeapRelease(psDevmemReservation->psDevmemHeap);
+			OSFreeMem(psDevmemReservation);
+			goto exit_noderef;
+		}
 	}
 
-	return eError;
+	OSLockRelease(psDevmemReservation->hLock);
+exit_noderef:
+	return;
 }
 
 /*************************************************************************/ /*!
@@ -402,6 +460,11 @@ DevmemIntCtxCreate(CONNECTION_DATA *psConnection,
 
 	PVR_DPF((PVR_DBG_MESSAGE, "%s", __func__));
 
+	/* Only allow request for a kernel context that comes from a direct bridge
+	 * (psConnection == NULL). Only the FW/KM Ctx is created over the direct bridge. */
+	PVR_LOG_RETURN_IF_INVALID_PARAM(!bKernelMemoryCtx || psConnection == NULL,
+	                                "bKernelMemoryCtx && psConnection");
+
 	/*
 	 * Ensure that we are safe to perform unaligned accesses on memory
 	 * we mark write-combine, as the compiler might generate
@@ -477,6 +540,19 @@ DevmemIntHeapCreate(DEVMEMINT_CTX *psDevmemCtx,
 {
 	DEVMEMINT_HEAP *psDevmemHeap;
 
+	PVRSRV_ERROR eError;
+	IMG_DEV_VIRTADDR sBlueprintHeapBaseAddr;
+	IMG_DEVMEM_SIZE_T uiBlueprintHeapLength;
+	IMG_DEVMEM_SIZE_T uiBlueprintResRgnLength;
+	IMG_UINT32 ui32BlueprintLog2DataPageSize;
+	IMG_UINT32 ui32BlueprintLog2ImportAlignment;
+	IMG_UINT32 ui32NumHeapConfigsOut;
+	IMG_UINT32 ui32NumHeapsOut;
+	IMG_BOOL bHeapParamsValidated = IMG_FALSE;
+
+	IMG_INT uiHeapConfigIndex, uiHeapIndex;
+
+
 	PVR_DPF((PVR_DBG_MESSAGE, "%s", __func__));
 
 	/* allocate a Devmem context */
@@ -487,13 +563,98 @@ DevmemIntHeapCreate(DEVMEMINT_CTX *psDevmemCtx,
 
 	DevmemIntCtxAcquire(psDevmemHeap->psDevmemCtx);
 
-	OSAtomicWrite(&psDevmemHeap->hRefCount, 1);
+	OSAtomicWrite(&psDevmemHeap->uiRefCount, 1);
+
+	/* getting number of heaps and heap configs */
+	eError = HeapCfgHeapConfigCount(NULL, psDevmemHeap->psDevmemCtx->psDevNode, &ui32NumHeapConfigsOut);
+
+	if (eError != PVRSRV_OK)
+	{
+		PVR_DPF((PVR_DBG_ERROR, "%s: Cannot retrieve the number of heap configs.\n", __func__));
+		eError = PVRSRV_ERROR_FAILED_TO_RETRIEVE_HEAPINFO;
+		goto ErrorCtxRelease;
+	}
+
+	for(uiHeapConfigIndex = 0; uiHeapConfigIndex < ui32NumHeapConfigsOut; uiHeapConfigIndex++)
+	{
+		eError = HeapCfgHeapCount(NULL, psDevmemHeap->psDevmemCtx->psDevNode, uiHeapConfigIndex, &ui32NumHeapsOut);
+		if (eError != PVRSRV_OK)
+		{
+			PVR_DPF((PVR_DBG_ERROR, "%s: Failed to retrieve the number of heaps for heap config index %d.\n",
+					 __func__, uiHeapConfigIndex));
+			eError = PVRSRV_ERROR_FAILED_TO_RETRIEVE_HEAPINFO;
+			goto ErrorCtxRelease;
+		}
+		else
+		{
+			for(uiHeapIndex = 0; uiHeapIndex < ui32NumHeapsOut; uiHeapIndex++)
+			{
+				/* Check page size and base addr match the heap blueprint */
+				eError = HeapCfgHeapDetails(NULL,
+											psDevmemHeap->psDevmemCtx->psDevNode,
+											uiHeapConfigIndex,
+											uiHeapIndex,
+											0, NULL,
+											&sBlueprintHeapBaseAddr,
+											&uiBlueprintHeapLength,
+											&uiBlueprintResRgnLength,
+											&ui32BlueprintLog2DataPageSize,
+											&ui32BlueprintLog2ImportAlignment);
+				if (eError == PVRSRV_OK)
+				{
+					if ((ui32BlueprintLog2DataPageSize == uiLog2DataPageSize) &&
+						(sHeapBaseAddr.uiAddr == sBlueprintHeapBaseAddr.uiAddr) &&
+						(uiBlueprintHeapLength == uiHeapLength))
+					{
+						bHeapParamsValidated = IMG_TRUE;
+						break;
+					}
+				}
+				else
+				{
+					PVR_DPF((PVR_DBG_ERROR, "%s: HeapCfgHeapDetails call fail with Heap Config Index: %d, and Heap Index: %d.\n"
+							,__func__, uiHeapConfigIndex, uiHeapIndex));
+					eError = PVRSRV_ERROR_FAILED_TO_RETRIEVE_HEAPINFO;
+					goto ErrorCtxRelease;
+				}
+			}
+		}
+
+		if (bHeapParamsValidated == IMG_TRUE)
+		{
+			break;
+		}
+	}
+
+	if (bHeapParamsValidated != IMG_TRUE)
+	{
+		PVR_DPF((PVR_DBG_ERROR, "%s:The passed parameters do not match with any heap blueprint.\n",
+					 __func__));
+		eError = PVRSRV_ERROR_INVALID_PARAMS;
+		goto ErrorCtxRelease;
+	}
+
 
 	psDevmemHeap->uiLog2PageSize = uiLog2DataPageSize;
+	psDevmemHeap->sBaseAddr = sHeapBaseAddr;
+	/* Store the last accessible address as our LastAddr. We can access
+	 * every address between sHeapBaseAddr and sHeapBaseAddr + HeapLength - 1
+	 */
+	psDevmemHeap->sLastAddr.uiAddr = sHeapBaseAddr.uiAddr + uiBlueprintHeapLength - 1;
+
+	PVR_DPF((PVR_DBG_VERBOSE, "%s: sBaseAddr = %" IMG_UINT64_FMTSPECX ", "
+	        "sLastAddr = %" IMG_UINT64_FMTSPECX, __func__,
+	        psDevmemHeap->sBaseAddr.uiAddr, psDevmemHeap->sLastAddr.uiAddr));
 
 	*ppsDevmemHeapPtr = psDevmemHeap;
 
 	return PVRSRV_OK;
+
+ErrorCtxRelease:
+	DevmemIntCtxRelease(psDevmemHeap->psDevmemCtx);
+	OSFreeMem(psDevmemHeap);
+
+	return eError;
 }
 
 PVRSRV_ERROR DevmemIntAllocDefBackingPage(PVRSRV_DEVICE_NODE *psDevNode,
@@ -593,30 +754,14 @@ DevmemIntMapPages(DEVMEMINT_RESERVATION *psReservation,
                   PVRSRV_MEMALLOCFLAGS_T uiFlags,
                   IMG_DEV_VIRTADDR sDevVAddrBase)
 {
-	PVRSRV_ERROR eError;
+	PVR_UNREFERENCED_PARAMETER(psReservation);
+	PVR_UNREFERENCED_PARAMETER(psPMR);
+	PVR_UNREFERENCED_PARAMETER(ui32PageCount);
+	PVR_UNREFERENCED_PARAMETER(ui32PhysicalPgOffset);
+	PVR_UNREFERENCED_PARAMETER(uiFlags);
+	PVR_UNREFERENCED_PARAMETER(sDevVAddrBase);
 
-	if (psReservation->psDevmemHeap->uiLog2PageSize > PMR_GetLog2Contiguity(psPMR))
-	{
-		PVR_DPF((PVR_DBG_ERROR,
-		         "%s: Device heap and PMR have incompatible Log2Contiguity (%u - %u). "
-		         "PMR contiguity must be a multiple of the heap contiguity!",
-		         __func__,
-		         psReservation->psDevmemHeap->uiLog2PageSize,
-		         PMR_GetLog2Contiguity(psPMR)));
-		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_INVALID_PARAMS, e0);
-	}
-
-	eError = MMU_MapPages(psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
-	                      uiFlags,
-	                      sDevVAddrBase,
-	                      psPMR,
-	                      ui32PhysicalPgOffset,
-	                      ui32PageCount,
-	                      NULL,
-	                      psReservation->psDevmemHeap->uiLog2PageSize);
-
-e0:
-	return eError;
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
 }
 
 PVRSRV_ERROR
@@ -624,14 +769,272 @@ DevmemIntUnmapPages(DEVMEMINT_RESERVATION *psReservation,
                     IMG_DEV_VIRTADDR sDevVAddrBase,
                     IMG_UINT32 ui32PageCount)
 {
+	PVR_UNREFERENCED_PARAMETER(psReservation);
+	PVR_UNREFERENCED_PARAMETER(sDevVAddrBase);
+	PVR_UNREFERENCED_PARAMETER(ui32PageCount);
+
+	return PVRSRV_ERROR_NOT_IMPLEMENTED;
+}
+
+static INLINE IMG_UINT32
+_ReservationPageCount(DEVMEMXINT_RESERVATION *psRsrv)
+{
+	return psRsrv->uiLength >> psRsrv->psDevmemHeap->uiLog2PageSize;
+}
+
+static INLINE IMG_DEV_VIRTADDR
+_ReservationPageAddress(DEVMEMXINT_RESERVATION *psRsrv, IMG_UINT32 uiVirtPageOffset)
+{
+	IMG_DEV_VIRTADDR sAddr = {
+		.uiAddr = psRsrv->sBase.uiAddr + (uiVirtPageOffset << psRsrv->psDevmemHeap->uiLog2PageSize)
+	};
+
+	return sAddr;
+}
+
+static INLINE PVRSRV_ERROR ReserveRangeParamValidation(DEVMEMINT_HEAP *psDevmemHeap,
+                                                       IMG_DEV_VIRTADDR sAllocationDevVAddr,
+                                                       IMG_DEVMEM_SIZE_T uiAllocationSize)
+{
+	IMG_DEV_VIRTADDR sLastReserveAddr;
+	IMG_UINT64 ui64InvalidSizeMask = (1 << psDevmemHeap->uiLog2PageSize) - 1;
+
+	PVR_LOG_RETURN_IF_INVALID_PARAM(psDevmemHeap != NULL, "psDevmemHeap");
+
+	sLastReserveAddr.uiAddr = sAllocationDevVAddr.uiAddr + uiAllocationSize - 1;
+
+	/* Check that the requested address is not less than the base address of the heap. */
+	if (sAllocationDevVAddr.uiAddr < psDevmemHeap->sBaseAddr.uiAddr)
+	{
+		PVR_DPF((PVR_DBG_ERROR,
+			"%s: sAllocationDevVAddr ("IMG_DEV_VIRTADDR_FMTSPEC") is invalid! "
+			"Must be greater or equal to "IMG_DEV_VIRTADDR_FMTSPEC,
+			__func__,
+			sAllocationDevVAddr.uiAddr,
+			psDevmemHeap->sBaseAddr.uiAddr));
+		return PVRSRV_ERROR_INVALID_PARAMS;
+	}
+
+	/* Check the allocation size is valid (must be page granular). */
+	if ((uiAllocationSize & ui64InvalidSizeMask) != 0 || uiAllocationSize == 0)
+	{
+		PVR_DPF((PVR_DBG_ERROR,
+			"%s: uiAllocationSize ("IMG_DEVMEM_SIZE_FMTSPEC") is invalid! Must a multiple of %u and greater than 0",
+			__func__,
+			uiAllocationSize,
+			1 << psDevmemHeap->uiLog2PageSize));
+		return PVRSRV_ERROR_INVALID_PARAMS;
+	}
+
+	/* Check that requested address + size fits in our heap. */
+	if (sLastReserveAddr.uiAddr > psDevmemHeap->sLastAddr.uiAddr)
+	{
+		PVR_DPF((PVR_DBG_ERROR,
+			"%s: sAllocationDevVAddr ("IMG_DEV_VIRTADDR_FMTSPEC") is invalid! "
+			"Must be lower than "IMG_DEV_VIRTADDR_FMTSPEC,
+			__func__,
+			sAllocationDevVAddr.uiAddr,
+			psDevmemHeap->sLastAddr.uiAddr - uiAllocationSize + 1));
+		return PVRSRV_ERROR_INVALID_PARAMS;
+	}
+
+	return PVRSRV_OK;
+}
+
+PVRSRV_ERROR
+DevmemXIntReserveRange(DEVMEMINT_HEAP *psDevmemHeap,
+                       IMG_DEV_VIRTADDR sAllocationDevVAddr,
+                       IMG_DEVMEM_SIZE_T uiAllocationSize,
+                       DEVMEMXINT_RESERVATION **ppsRsrv)
+{
+	DEVMEMXINT_RESERVATION *psRsrv;
+	IMG_UINT32 uiNumPages;
+	PVRSRV_ERROR eError;
+
+	PVR_LOG_RETURN_IF_INVALID_PARAM(ppsRsrv != NULL, "ppsRsrv");
+
+	eError = ReserveRangeParamValidation(psDevmemHeap,
+	                                     sAllocationDevVAddr,
+	                                     uiAllocationSize);
+	PVR_LOG_RETURN_IF_ERROR(eError, "ReserveRangeParamValidation");
+
+
+	if (!DevmemIntHeapAcquire(psDevmemHeap))
+	{
+		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_REFCOUNT_OVERFLOW, ErrorReturnError);
+	}
+
+	uiNumPages = uiAllocationSize >> psDevmemHeap->uiLog2PageSize;
+	psRsrv = OSAllocZMem(sizeof(*psRsrv->ppsPMR) * uiNumPages + sizeof(*psRsrv));
+	PVR_LOG_GOTO_IF_NOMEM(psRsrv, eError, ErrorUnreferenceHeap);
+
+	eError = OSLockCreate(&psRsrv->hLock);
+	PVR_LOG_GOTO_IF_ERROR(eError, "OSLockCreate", ErrorFreeReservation);
+
+	psRsrv->sBase = sAllocationDevVAddr;
+	psRsrv->uiLength = uiAllocationSize;
+	psRsrv->ppsPMR = IMG_OFFSET_ADDR(psRsrv, sizeof(*psRsrv));
+
+	eError = MMU_Alloc(psDevmemHeap->psDevmemCtx->psMMUContext,
+	                   uiAllocationSize,
+	                   &uiAllocationSize,
+	                   0, /* IMG_UINT32 uiProtFlags */
+	                   0, /* alignment is n/a since we supply devvaddr */
+	                   &sAllocationDevVAddr,
+	                   psDevmemHeap->uiLog2PageSize);
+	PVR_GOTO_IF_ERROR(eError, ErrorDestroyLock);
+
+	/* since we supplied the virt addr, MMU_Alloc shouldn't have
+	   chosen a new one for us */
+	PVR_ASSERT(sAllocationDevVAddr.uiAddr == psRsrv->sBase.uiAddr);
+
+	psRsrv->psDevmemHeap = psDevmemHeap;
+	*ppsRsrv = psRsrv;
+
+	return PVRSRV_OK;
+
+ErrorDestroyLock:
+	OSLockDestroy(psRsrv->hLock);
+ErrorFreeReservation:
+	OSFreeMem(psRsrv);
+ErrorUnreferenceHeap:
+	DevmemIntHeapRelease(psDevmemHeap);
+ErrorReturnError:
+	return eError;
+}
+
+PVRSRV_ERROR
+DevmemXIntUnreserveRange(DEVMEMXINT_RESERVATION *psRsrv)
+{
+	IMG_UINT32 i;
+
+	MMU_Free(psRsrv->psDevmemHeap->psDevmemCtx->psMMUContext,
+	         psRsrv->sBase,
+	         psRsrv->uiLength,
+	         psRsrv->psDevmemHeap->uiLog2PageSize);
+
+	/* No need to lock the mapping here since this is a handle destruction path which can not be
+	 * executed while there are outstanding handle lookups, i.e. other operations are performed
+	 * on the mapping. Bridge and handle framework also make sure this path can also not be executed
+	 * concurrently. */
+
+	for (i = 0; i < _ReservationPageCount(psRsrv); i++)
+	{
+		if (psRsrv->ppsPMR[i] != NULL)
+		{
+			PMRUnrefPMR2(psRsrv->ppsPMR[i]);
+		}
+	}
+
+	/* Don't bother with refcount on reservation, as a reservation only ever
+	 * holds one mapping, so we directly decrement the refcount on the heap
+	 * instead.
+	 * Function will print an error if the heap could not be unreferenced. */
+	DevmemIntHeapRelease(psRsrv->psDevmemHeap);
+
+	OSLockDestroy(psRsrv->hLock);
+	OSFreeMem(psRsrv);
+
+	return PVRSRV_OK;
+}
+
+PVRSRV_ERROR
+DevmemXIntMapPages(DEVMEMXINT_RESERVATION *psRsrv,
+                   PMR *psPMR,
+                   IMG_UINT32 uiPageCount,
+                   IMG_UINT32 uiPhysPageOffset,
+                   PVRSRV_MEMALLOCFLAGS_T uiFlags,
+                   IMG_UINT32 uiVirtPageOffset)
+{
+	PVRSRV_ERROR eError;
+	IMG_UINT32 uiPMRMaxChunkCount = PMRGetMaxChunkCount(psPMR);
+	DEVMEMINT_HEAP *psDevmemHeap = psRsrv->psDevmemHeap;
+	IMG_UINT32 uiLog2PageSize = psDevmemHeap->uiLog2PageSize;
+	IMG_UINT32 i;
+
+	PVR_LOG_RETURN_IF_INVALID_PARAM((uiPageCount + uiPhysPageOffset) <= uiPMRMaxChunkCount, "uiPageCount+uiPhysPageOffset");
+
+	/* The range is not valid for the given virtual descriptor */
+	PVR_LOG_RETURN_IF_FALSE((uiVirtPageOffset + uiPageCount) <= _ReservationPageCount(psRsrv),
+	                        "mapping offset out of range", PVRSRV_ERROR_DEVICEMEM_OUT_OF_RANGE);
+	PVR_LOG_RETURN_IF_FALSE((uiFlags & ~PVRSRV_MEMALLOCFLAGS_DEVMEMX_VIRTUAL_MASK) == 0,
+	                        "invalid flags", PVRSRV_ERROR_INVALID_FLAGS);
+
+	if (uiLog2PageSize > PMR_GetLog2Contiguity(psPMR))
+	{
+		PVR_DPF((PVR_DBG_ERROR, "%s: Device heap and PMR have incompatible "
+		        "Log2Contiguity (%u - %u). PMR contiguity must be a multiple "
+		        "of the heap contiguity!", __func__, uiLog2PageSize,
+		        PMR_GetLog2Contiguity(psPMR)));
+		return PVRSRV_ERROR_INVALID_PARAMS;
+	}
+
+	OSLockAcquire(psRsrv->hLock);
+
+	eError = MMU_MapPages(psDevmemHeap->psDevmemCtx->psMMUContext,
+	                      uiFlags,
+	                      _ReservationPageAddress(psRsrv, uiVirtPageOffset),
+	                      psPMR,
+	                      uiPhysPageOffset,
+	                      uiPageCount,
+	                      NULL,
+	                      psDevmemHeap->uiLog2PageSize);
+	PVR_GOTO_IF_ERROR(eError, ErrUnlock);
+
+	for (i = uiVirtPageOffset; i < (uiVirtPageOffset + uiPageCount); i++)
+	{
+		PMRRefPMR2(psPMR);
+
+		if (psRsrv->ppsPMR[i] != NULL)
+		{
+			PMRUnrefPMR2(psRsrv->ppsPMR[i]);
+		}
+
+		psRsrv->ppsPMR[i] = psPMR;
+	}
+
+	OSLockRelease(psRsrv->hLock);
+
+	return PVRSRV_OK;
+
+ErrUnlock:
+	OSLockRelease(psRsrv->hLock);
+
+	return eError;
+}
+
+PVRSRV_ERROR
+DevmemXIntUnmapPages(DEVMEMXINT_RESERVATION *psRsrv,
+                     IMG_UINT32 uiVirtPageOffset,
+                     IMG_UINT32 uiPageCount)
+{
+	DEVMEMINT_HEAP *psDevmemHeap = psRsrv->psDevmemHeap;
+	IMG_UINT32 i;
+
+	PVR_LOG_RETURN_IF_FALSE((uiVirtPageOffset + uiPageCount) <= _ReservationPageCount(psRsrv),
+	                        "mapping offset out of range", PVRSRV_ERROR_DEVICEMEM_OUT_OF_RANGE);
+
+	OSLockAcquire(psRsrv->hLock);
+
 	/* Unmap the pages and mark them invalid in the MMU PTE */
-	MMU_UnmapPages(psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
+	MMU_UnmapPages(psDevmemHeap->psDevmemCtx->psMMUContext,
 	               0,
-	               sDevVAddrBase,
-	               ui32PageCount,
+	               _ReservationPageAddress(psRsrv, uiVirtPageOffset),
+	               uiPageCount,
 	               NULL,
-	               psReservation->psDevmemHeap->uiLog2PageSize,
+	               psDevmemHeap->uiLog2PageSize,
 	               0);
+
+	for (i = uiVirtPageOffset; i < (uiVirtPageOffset + uiPageCount); i++)
+	{
+		if (psRsrv->ppsPMR[i] != NULL)
+		{
+			PMRUnrefPMR2(psRsrv->ppsPMR[i]);
+			psRsrv->ppsPMR[i] = NULL;
+		}
+	}
+
+	OSLockRelease(psRsrv->hLock);
 
 	return PVRSRV_OK;
 }
@@ -666,13 +1069,18 @@ DevmemIntMapPMR(DEVMEMINT_HEAP *psDevmemHeap,
 		         __func__,
 		         uiLog2HeapContiguity,
 		         PMR_GetLog2Contiguity(psPMR) ));
-		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_INVALID_PARAMS, e0);
+		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_INVALID_PARAMS, ErrorReturnError);
 	}
 	psDevNode = psDevmemHeap->psDevmemCtx->psDevNode;
 
+	if (!DevmemIntReservationAcquire(psReservation))
+	{
+		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_REFCOUNT_OVERFLOW, ErrorReturnError);
+	}
+
 	/* allocate memory to record the mapping info */
 	psMapping = OSAllocMem(sizeof(*psMapping));
-	PVR_LOG_GOTO_IF_NOMEM(psMapping, eError, e0);
+	PVR_LOG_GOTO_IF_NOMEM(psMapping, eError, ErrorUnreference);
 
 	uiAllocationSize = psReservation->uiLength;
 
@@ -680,7 +1088,7 @@ DevmemIntMapPMR(DEVMEMINT_HEAP *psDevmemHeap,
 	PVR_ASSERT((IMG_DEVMEM_SIZE_T) ui32NumDevPages << uiLog2HeapContiguity == uiAllocationSize);
 
 	eError = PMRLockSysPhysAddresses(psPMR);
-	PVR_GOTO_IF_ERROR(eError, e2);
+	PVR_GOTO_IF_ERROR(eError, ErrorFreeMapping);
 
 	sAllocationDevVAddr = psReservation->sBase;
 
@@ -723,7 +1131,7 @@ DevmemIntMapPMR(DEVMEMINT_HEAP *psDevmemHeap,
 			                                      uiInitValue,
 			                                      pszPageName,
 			                                      IMG_TRUE);
-			PVR_GOTO_IF_ERROR(eError, e3);
+			PVR_GOTO_IF_ERROR(eError, ErrorUnlockPhysAddr);
 		}
 
 		/* N.B. We pass mapping permission flags to MMU_MapPages and let
@@ -736,7 +1144,7 @@ DevmemIntMapPMR(DEVMEMINT_HEAP *psDevmemHeap,
 		                      ui32NumDevPages,
 		                      NULL,
 		                      uiLog2HeapContiguity);
-		PVR_GOTO_IF_ERROR(eError, e4);
+		PVR_GOTO_IF_ERROR(eError, ErrorFreeDefBackingPage);
 	}
 	else
 	{
@@ -746,22 +1154,18 @@ DevmemIntMapPMR(DEVMEMINT_HEAP *psDevmemHeap,
 		                        ui32NumDevPages << uiLog2HeapContiguity,
 		                        uiMapFlags,
 		                        uiLog2HeapContiguity);
-		PVR_GOTO_IF_ERROR(eError, e3);
+		PVR_GOTO_IF_ERROR(eError, ErrorUnlockPhysAddr);
 	}
 
 	psMapping->psReservation = psReservation;
 	psMapping->uiNumPages = ui32NumDevPages;
 	psMapping->psPMR = psPMR;
 
-	/* Don't bother with refcount on reservation, as a reservation
-	   only ever holds one mapping, so we directly increment the
-	   refcount on the heap instead */
-	DevmemIntHeapAcquire(psMapping->psReservation->psDevmemHeap);
-
 	*ppsMappingPtr = psMapping;
 
 	return PVRSRV_OK;
-e4:
+
+ErrorFreeDefBackingPage:
 	if (bNeedBacking)
 	{
 		/*if the mapping failed, the allocated dummy ref count need
@@ -770,18 +1174,24 @@ e4:
 		                            psDefPage,
 		                            pszPageName);
 	}
-e3:
+
+ErrorUnlockPhysAddr:
 	{
-		PVRSRV_ERROR eError1=PVRSRV_OK;
+		PVRSRV_ERROR eError1 = PVRSRV_OK;
 		eError1 = PMRUnlockSysPhysAddresses(psPMR);
 		PVR_LOG_IF_ERROR(eError1, "PMRUnlockSysPhysAddresses");
 
 		*ppsMappingPtr = NULL;
 	}
-e2:
+
+ErrorFreeMapping:
 	OSFreeMem(psMapping);
 
-e0:
+ErrorUnreference:
+	/* if fails there's not much to do (the function will print an error) */
+	DevmemIntReservationRelease(psReservation);
+
+ErrorReturnError:
 	PVR_ASSERT (eError != PVRSRV_OK);
 	return eError;
 }
@@ -832,7 +1242,7 @@ DevmemIntUnmapPMR(DEVMEMINT_MAPPING *psMapping)
 				sAllocationDevVAddr,
 				ui32NumDevPages,
 				NULL,
-				psMapping->psReservation->psDevmemHeap->uiLog2PageSize,
+				psDevmemHeap->uiLog2PageSize,
 				0);
 	}
 	else
@@ -840,18 +1250,13 @@ DevmemIntUnmapPMR(DEVMEMINT_MAPPING *psMapping)
 		MMU_UnmapPMRFast(psDevmemHeap->psDevmemCtx->psMMUContext,
 		                 sAllocationDevVAddr,
 		                 ui32NumDevPages,
-		                 psMapping->psReservation->psDevmemHeap->uiLog2PageSize);
+		                 psDevmemHeap->uiLog2PageSize);
 	}
-
-
 
 	eError = PMRUnlockSysPhysAddresses(psMapping->psPMR);
 	PVR_ASSERT(eError == PVRSRV_OK);
 
-	/* Don't bother with refcount on reservation, as a reservation
-	   only ever holds one mapping, so we directly decrement the
-	   refcount on the heap instead */
-	DevmemIntHeapRelease(psDevmemHeap);
+	DevmemIntReservationRelease(psMapping->psReservation);
 
 	OSFreeMem(psMapping);
 
@@ -868,9 +1273,29 @@ DevmemIntReserveRange(DEVMEMINT_HEAP *psDevmemHeap,
 	PVRSRV_ERROR eError;
 	DEVMEMINT_RESERVATION *psReservation;
 
+	PVR_LOG_RETURN_IF_INVALID_PARAM(ppsReservationPtr != NULL, "ppsReservationPtr");
+
+	eError = ReserveRangeParamValidation(psDevmemHeap,
+	                                     sAllocationDevVAddr,
+	                                     uiAllocationSize);
+	PVR_LOG_RETURN_IF_ERROR(eError, "ReserveRangeParamValidation");
+
+	if (!DevmemIntHeapAcquire(psDevmemHeap))
+	{
+		PVR_GOTO_WITH_ERROR(eError, PVRSRV_ERROR_REFCOUNT_OVERFLOW,
+		                    ErrorReturnError);
+	}
+
 	/* allocate memory to record the reservation info */
 	psReservation = OSAllocMem(sizeof(*psReservation));
-	PVR_LOG_GOTO_IF_NOMEM(psReservation, eError, e0);
+	PVR_LOG_GOTO_IF_NOMEM(psReservation, eError, ErrorUnreference);
+
+	/* Create lock */
+	eError = OSLockCreate(&psReservation->hLock);
+	PVR_LOG_GOTO_IF_ERROR(eError, "OSLockCreate", ErrorFreeReservation);
+
+	/* Initialise refcount */
+	psReservation->i32RefCount = 1;
 
 	psReservation->sBase = sAllocationDevVAddr;
 	psReservation->uiLength = uiAllocationSize;
@@ -882,13 +1307,11 @@ DevmemIntReserveRange(DEVMEMINT_HEAP *psDevmemHeap,
 	                   0, /* alignment is n/a since we supply devvaddr */
 	                   &sAllocationDevVAddr,
 	                   psDevmemHeap->uiLog2PageSize);
-	PVR_GOTO_IF_ERROR(eError, e1);
+	PVR_GOTO_IF_ERROR(eError, ErrorDestroyLock);
 
 	/* since we supplied the virt addr, MMU_Alloc shouldn't have
 	   chosen a new one for us */
 	PVR_ASSERT(sAllocationDevVAddr.uiAddr == psReservation->sBase.uiAddr);
-
-	DevmemIntHeapAcquire(psDevmemHeap);
 
 	psReservation->psDevmemHeap = psDevmemHeap;
 	*ppsReservationPtr = psReservation;
@@ -899,10 +1322,17 @@ DevmemIntReserveRange(DEVMEMINT_HEAP *psDevmemHeap,
 	 *  error exit paths follow
 	 */
 
-e1:
+ErrorDestroyLock:
+	OSLockDestroy(psReservation->hLock);
+
+ErrorFreeReservation:
 	OSFreeMem(psReservation);
 
-e0:
+ErrorUnreference:
+	/* if fails there's not much to do (the function will print an error) */
+	DevmemIntHeapRelease(psDevmemHeap);
+
+ErrorReturnError:
 	PVR_ASSERT(eError != PVRSRV_OK);
 	return eError;
 }
@@ -910,31 +1340,22 @@ e0:
 PVRSRV_ERROR
 DevmemIntUnreserveRange(DEVMEMINT_RESERVATION *psReservation)
 {
-	IMG_DEV_VIRTADDR sBase        = psReservation->sBase;
-	IMG_UINT32 uiLength           = psReservation->uiLength;
-	IMG_UINT32 uiLog2DataPageSize = psReservation->psDevmemHeap->uiLog2PageSize;
 
-	MMU_Free(psReservation->psDevmemHeap->psDevmemCtx->psMMUContext,
-	         sBase,
-	         uiLength,
-	         uiLog2DataPageSize);
+	DevmemIntReservationRelease(psReservation);
 
-	DevmemIntHeapRelease(psReservation->psDevmemHeap);
-	OSFreeMem(psReservation);
-
-    return PVRSRV_OK;
+	return PVRSRV_OK;
 }
 
 
 PVRSRV_ERROR
 DevmemIntHeapDestroy(DEVMEMINT_HEAP *psDevmemHeap)
 {
-	if (OSAtomicRead(&psDevmemHeap->hRefCount) != 1)
+	if (OSAtomicRead(&psDevmemHeap->uiRefCount) != DEVMEMHEAP_REFCOUNT_MIN)
 	{
 		PVR_DPF((PVR_DBG_ERROR, "BUG!  %s called but has too many references (%d) "
-		         "which probably means allocations have been made from the heap and not freed",
-		         __func__,
-		         OSAtomicRead(&psDevmemHeap->hRefCount)));
+		         "which probably means reservations & mappings have been made from "
+		         "the heap and not freed", __func__,
+		         OSAtomicRead(&psDevmemHeap->uiRefCount)));
 
 		/*
 		 * Try again later when you've freed all the memory
@@ -950,7 +1371,7 @@ DevmemIntHeapDestroy(DEVMEMINT_HEAP *psDevmemHeap)
 		return PVRSRV_ERROR_RETRY;
 	}
 
-	PVR_ASSERT(OSAtomicRead(&psDevmemHeap->hRefCount) == 1);
+	PVR_ASSERT(OSAtomicRead(&psDevmemHeap->uiRefCount) == DEVMEMHEAP_REFCOUNT_MIN);
 
 	DevmemIntCtxRelease(psDevmemHeap->psDevmemCtx);
 
@@ -983,6 +1404,15 @@ DevmemIntChangeSparse(DEVMEMINT_HEAP *psDevmemHeap,
 	IMG_UINT32 *pai32UnmapIndices = pai32FreeIndices;
 	IMG_UINT32 uiMapPageCount = ui32AllocPageCount;
 	IMG_UINT32 uiUnmapPageCount = ui32FreePageCount;
+
+	if (uiLog2HeapContiguity > uiLog2PMRContiguity)
+	{
+		PVR_DPF((PVR_DBG_ERROR,
+				"%s: Invalid PMR Contiguity for given DevmemHeap.",
+				__func__));
+		return PVRSRV_ERROR_PMR_INCOMPATIBLE_CONTIGUITY;
+	}
+
 
 	/* Special case:
 	 * Adjust indices if we map into a heap that uses smaller page sizes
@@ -1359,10 +1789,12 @@ DevmemIntAcquireRemoteCtx(PMR *psPMR,
 		psCtxExport = IMG_CONTAINER_OF(psListNode, DEVMEMINT_CTX_EXPORT, sNode);
 		if (psCtxExport->psPMR == psPMR)
 		{
-			OSWRLockReleaseRead(g_hExportCtxListLock);
 			DevmemIntCtxAcquire(psCtxExport->psDevmemCtx);
 			*ppsContext = psCtxExport->psDevmemCtx;
 			*phPrivData = psCtxExport->psDevmemCtx->hPrivData;
+
+			OSWRLockReleaseRead(g_hExportCtxListLock);
+
 			return PVRSRV_OK;
 		}
 	}
@@ -1393,31 +1825,33 @@ PVRSRV_ERROR DevmemIntRegisterPFNotifyKM(DEVMEMINT_CTX *psDevmemCtx,
 	DLLIST_NODE         *psNode, *psNodeNext;
 	DEVMEMINT_PF_NOTIFY *psNotifyNode;
 	IMG_BOOL            bPresent = IMG_FALSE;
+	PVRSRV_ERROR        eError;
 
 	PVR_LOG_RETURN_IF_INVALID_PARAM(psDevmemCtx, "psDevmemCtx");
+
+	/* Acquire write lock for the duration, to avoid resource free
+	 * while trying to read (no need to then also acquire the read lock
+	 * as we have exclusive access while holding the write lock)
+	 */
+	OSWRLockAcquireWrite(psDevmemCtx->hListLock);
 
 	psDevNode = psDevmemCtx->psDevNode;
 
 	if (bRegister)
 	{
-		OSWRLockAcquireRead(psDevmemCtx->hListLock);
 		/* If this is the first PID in the list, the device memory context
 		 * needs to be registered for notification */
 		if (dllist_is_empty(&psDevmemCtx->sProcessNotifyListHead))
 		{
-			OSWRLockReleaseRead(psDevmemCtx->hListLock);
+			OSWRLockAcquireWrite(psDevNode->hMemoryContextPageFaultNotifyListLock);
 			dllist_add_to_tail(&psDevNode->sMemoryContextPageFaultNotifyListHead,
 			                   &psDevmemCtx->sPageFaultNotifyListElem);
-		}
-		else
-		{
-			OSWRLockReleaseRead(psDevmemCtx->hListLock);
+			OSWRLockReleaseWrite(psDevNode->hMemoryContextPageFaultNotifyListLock);
 		}
 	}
 
 	/* Loop through the registered PIDs and check whether this one is
 	 * present */
-	OSWRLockAcquireRead(psDevmemCtx->hListLock);
 	dllist_foreach_node(&(psDevmemCtx->sProcessNotifyListHead), psNode, psNodeNext)
 	{
 		psNotifyNode = IMG_CONTAINER_OF(psNode, DEVMEMINT_PF_NOTIFY, sProcessNotifyListElem);
@@ -1428,7 +1862,6 @@ PVRSRV_ERROR DevmemIntRegisterPFNotifyKM(DEVMEMINT_CTX *psDevmemCtx,
 			break;
 		}
 	}
-	OSWRLockReleaseRead(psDevmemCtx->hListLock);
 
 	if (bRegister)
 	{
@@ -1437,7 +1870,8 @@ PVRSRV_ERROR DevmemIntRegisterPFNotifyKM(DEVMEMINT_CTX *psDevmemCtx,
 			PVR_DPF((PVR_DBG_ERROR,
 			         "%s: Trying to register a PID that is already registered",
 			         __func__));
-			return PVRSRV_ERROR_PID_ALREADY_REGISTERED;
+			eError = PVRSRV_ERROR_PID_ALREADY_REGISTERED;
+			goto err_already_registered;
 		}
 
 		psNotifyNode = OSAllocMem(sizeof(*psNotifyNode));
@@ -1446,12 +1880,12 @@ PVRSRV_ERROR DevmemIntRegisterPFNotifyKM(DEVMEMINT_CTX *psDevmemCtx,
 			PVR_DPF((PVR_DBG_ERROR,
 			         "%s: Unable to allocate memory for the notify list",
 			          __func__));
-			return PVRSRV_ERROR_OUT_OF_MEMORY;
+			eError = PVRSRV_ERROR_OUT_OF_MEMORY;
+			goto err_out_of_mem;
 		}
 		psNotifyNode->ui32PID = ui32PID;
-		OSWRLockAcquireWrite(psDevmemCtx->hListLock);
+		/* Write lock is already held */
 		dllist_add_to_tail(&(psDevmemCtx->sProcessNotifyListHead), &(psNotifyNode->sProcessNotifyListElem));
-		OSWRLockReleaseWrite(psDevmemCtx->hListLock);
 	}
 	else
 	{
@@ -1460,26 +1894,31 @@ PVRSRV_ERROR DevmemIntRegisterPFNotifyKM(DEVMEMINT_CTX *psDevmemCtx,
 			PVR_DPF((PVR_DBG_ERROR,
 			         "%s: Trying to unregister a PID that is not registered",
 			         __func__));
-			return PVRSRV_ERROR_PID_NOT_REGISTERED;
+			eError = PVRSRV_ERROR_PID_NOT_REGISTERED;
+			goto err_not_registered;
 		}
+		/* Write lock is already held */
 		dllist_remove_node(psNode);
 		psNotifyNode = IMG_CONTAINER_OF(psNode, DEVMEMINT_PF_NOTIFY, sProcessNotifyListElem);
 		OSFreeMem(psNotifyNode);
-	}
 
-	if (!bRegister)
-	{
 		/* If the last process in the list is being unregistered, then also
 		 * unregister the device memory context from the notify list. */
-		OSWRLockAcquireWrite(psDevmemCtx->hListLock);
 		if (dllist_is_empty(&psDevmemCtx->sProcessNotifyListHead))
 		{
+			OSWRLockAcquireWrite(psDevNode->hMemoryContextPageFaultNotifyListLock);
 			dllist_remove_node(&psDevmemCtx->sPageFaultNotifyListElem);
+			OSWRLockReleaseWrite(psDevNode->hMemoryContextPageFaultNotifyListLock);
 		}
-		OSWRLockReleaseWrite(psDevmemCtx->hListLock);
 	}
+	eError = PVRSRV_OK;
 
-	return PVRSRV_OK;
+err_already_registered:
+err_out_of_mem:
+err_not_registered:
+
+	OSWRLockReleaseWrite(psDevmemCtx->hListLock);
+	return eError;
 }
 
 /*************************************************************************/ /*!
