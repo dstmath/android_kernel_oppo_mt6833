@@ -16,7 +16,7 @@ struct mtk_vcu_queue *mtk_vcu_mem_init(struct device *dev,
 	struct mtk_vcu_queue *vcu_queue;
 
 	pr_debug("Allocate new vcu queue !\n");
-	vcu_queue = kzalloc(sizeof(struct mtk_vcu_queue), GFP_KERNEL);
+	vcu_queue = vmalloc(sizeof(struct mtk_vcu_queue));
 	if (vcu_queue == NULL) {
 		pr_info("Allocate new vcu queue fail!\n");
 		return NULL;
@@ -69,7 +69,7 @@ void mtk_vcu_mem_release(struct mtk_vcu_queue *vcu_queue)
 		kfree(tmp);
 	}
 	mutex_unlock(&vcu_queue->mmap_lock);
-	kfree(vcu_queue);
+	vfree(vcu_queue);
 	vcu_queue = NULL;
 }
 
@@ -361,9 +361,14 @@ int vcu_buffer_flush_all(struct device *dev, struct mtk_vcu_queue *vcu_queue)
 	unsigned int buffer, num_buffers;
 	void *cook = NULL;
 
+	mutex_lock(&vcu_queue->mmap_lock);
+
 	num_buffers = vcu_queue->num_buffers;
-	if (num_buffers == 0U)
+	if (num_buffers == 0U) {
+		mutex_unlock(&vcu_queue->mmap_lock);
 		return 0;
+	}
+
 	for (buffer = 0; buffer < num_buffers; buffer++) {
 		vcu_buffer = &vcu_queue->bufs[buffer];
 		pr_debug("Cache clean %s buffer=%d iova=%lx size=%d num=%d\n",
@@ -381,6 +386,8 @@ int vcu_buffer_flush_all(struct device *dev, struct mtk_vcu_queue *vcu_queue)
 				vcu_buffer->dbuf, DMA_TO_DEVICE);
 	}
 
+	mutex_unlock(&vcu_queue->mmap_lock);
+
 	return 0;
 }
 
@@ -392,11 +399,14 @@ int vcu_buffer_cache_sync(struct device *dev, struct mtk_vcu_queue *vcu_queue,
 	unsigned int buffer = 0;
 	void *cook = NULL;
 
+	mutex_lock(&vcu_queue->mmap_lock);
+
 	num_buffers = vcu_queue->num_buffers;
 	if (num_buffers == 0U) {
 		pr_info("Cache %s buffer fail, iova = %lx, size = %d, vcu no buffers\n",
 			(op == DMA_TO_DEVICE) ? "flush" : "invalidate",
 			(unsigned long)dma_addr, (unsigned int)size);
+		mutex_unlock(&vcu_queue->mmap_lock);
 		return -1;
 	}
 
@@ -415,15 +425,15 @@ int vcu_buffer_cache_sync(struct device *dev, struct mtk_vcu_queue *vcu_queue,
 				(unsigned int)vcu_buffer->size);
 
 			if (vcu_buffer->dbuf == NULL) {
-				cook = vcu_queue->mem_ops->vaddr(
-					vcu_buffer->mem_priv);
+				cook = vcu_queue->mem_ops->vaddr(vcu_buffer->mem_priv);
 				if (op == DMA_TO_DEVICE)
 					dmac_map_area((void *)cook, size, op);
 				else
 					dmac_unmap_area((void *)cook, size, op);
 			} else
-				vcu_io_buffer_cache_sync(dev,
-					vcu_buffer->dbuf, op);
+				vcu_io_buffer_cache_sync(dev, vcu_buffer->dbuf, op);
+
+			mutex_unlock(&vcu_queue->mmap_lock);
 			return 0;
 		}
 	}
@@ -431,6 +441,7 @@ int vcu_buffer_cache_sync(struct device *dev, struct mtk_vcu_queue *vcu_queue,
 	pr_info("Cache %s buffer fail, iova = %lx, size = %d\n",
 		(op == DMA_TO_DEVICE) ? "flush" : "invalidate",
 		(unsigned long)dma_addr, (unsigned int)size);
+	mutex_unlock(&vcu_queue->mmap_lock);
 
 	return -1;
 }
