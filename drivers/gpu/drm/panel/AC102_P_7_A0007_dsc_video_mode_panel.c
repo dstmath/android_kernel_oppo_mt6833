@@ -43,7 +43,7 @@ extern unsigned int oplus_lcm_display_on;
 extern void __attribute((weak)) lcd_queue_load_tp_fw(void) { return; };
 extern int __attribute__((weak)) tp_gesture_enable_flag(void) {return 0;};
 extern void __attribute__((weak)) tp_gpio_current_leakage_handler(bool normal) {return;};
-extern bool __attribute__((weak)) tp_boot_mode_normal() {return true;};
+extern bool __attribute__((weak)) tp_boot_mode_normal(void) {return true;};
 
 /* enable this to check panel self -bist pattern */
 /* #define PANEL_BIST_PATTERN */
